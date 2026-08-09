@@ -120,7 +120,6 @@ jobs:
   sonar:
     name: SonarCloud Analysis
     runs-on: ubuntu-latest
-    if: ${{ secrets.SONAR_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -132,9 +131,13 @@ jobs:
           cache: true
 
       - name: Generate coverage report
+        if: env.SONAR_TOKEN != ''
         run: go test -coverprofile=coverage.out $(go list ./... | grep -v /examples)
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
       - name: Run SonarCloud scan
+        if: env.SONAR_TOKEN != ''
         uses: sonarsource/sonarqube-scan-action@v5
         with:
           args: >
