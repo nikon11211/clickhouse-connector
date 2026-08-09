@@ -28,13 +28,13 @@ linters:
     revive:
       rules:
         - name: exported
-          severity: low
+          severity: warning
           disabled: false
         - name: package-comments
-          severity: low
+          severity: warning
           disabled: true
     gosec:
-      severity: low
+      severity: warning
       confidence: low
 
   exclusions:
