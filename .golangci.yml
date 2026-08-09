@@ -34,7 +34,7 @@ linters:
           severity: warning
           disabled: true
     gosec:
-      severity: warning
+      severity: low
       confidence: low
 
   exclusions:

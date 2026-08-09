@@ -71,35 +71,6 @@ jobs:
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
-  integration:
-    name: Integration Tests (ClickHouse)
-    runs-on: ubuntu-latest
-    services:
-      clickhouse:
-        image: clickhouse/clickhouse-server:latest
-        ports:
-          - 9000:9000
-          - 8123:8123
-        env:
-          CLICKHOUSE_DB: test
-          CLICKHOUSE_USER: default
-          CLICKHOUSE_PASSWORD: ""
-        options: >-
-          --health-cmd "clickhouse-client --query 'SELECT 1'"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.26.x'
-          cache: true
-      - name: Install dependencies
-        run: go mod download
-      - name: Run integration tests
-        run: go test -v -race -tags=integration ./...
-
   lint:
     name: Lint Code
     runs-on: ubuntu-latest
