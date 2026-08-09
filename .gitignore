@@ -4,34 +4,20 @@
 *.dll
 *.so
 *.dylib
-bin/
-dist/
-
-# Test binary
 *.test
 
-# Output of go coverage
-*.out
-coverage.html
+# Test coverage
+coverage.txt
+coverage.out
+*.coverprofile
 
-# Dependency directories
-vendor/
-
-# IDE files
-.vscode/
+# IDE
 .idea/
-*.swp
-*.swo
-*~
+.vscode/
+*.iml
 
-# Environment files
-.env
-.env.local
-*.env
-
-# OS files
+# OS
 .DS_Store
-Thumbs.db
 
-# Logs
-*.log
+# Go
+/vendor/

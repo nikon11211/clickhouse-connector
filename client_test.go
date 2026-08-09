@@ -4,11 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"testing"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/column"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type MockLogger struct {
@@ -35,12 +44,100 @@ func (m *MockLogger) Error(msg string) {
 	m.Called(msg)
 }
 
-func TestNewClient_Success(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
+func newMockLogger() *MockLogger {
+	l := new(MockLogger)
+	l.On("Info", mock.Anything).Return()
+	l.On("Error", mock.Anything).Return()
+	l.On("Debug", mock.Anything).Return()
+	l.On("DebugF", mock.Anything, mock.Anything).Return()
+	l.On("Warn", mock.Anything).Return()
+	return l
+}
 
-	config := &Config{
+type fakeConn struct {
+	pingErr  error
+	closeErr error
+	execErr  error
+	queryErr error
+	closed   bool
+	pings    int
+	opts     *clickhouse.Options
+}
+
+func (f *fakeConn) Ping(ctx context.Context) error {
+	f.pings++
+	return f.pingErr
+}
+
+func (f *fakeConn) Close() error {
+	f.closed = true
+	return f.closeErr
+}
+
+func (f *fakeConn) Query(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+	if f.queryErr != nil {
+		return nil, f.queryErr
+	}
+	return &fakeRows{}, nil
+}
+
+func (f *fakeConn) QueryRow(ctx context.Context, query string, args ...any) driver.Row {
+	return &fakeRow{}
+}
+
+func (f *fakeConn) Exec(ctx context.Context, query string, args ...any) error {
+	return f.execErr
+}
+
+func (f *fakeConn) Select(ctx context.Context, dest any, query string, args ...any) error {
+	return f.execErr
+}
+
+func (f *fakeConn) AsyncInsert(ctx context.Context, query string, wait bool, args ...any) error {
+	return f.execErr
+}
+
+func (f *fakeConn) PrepareBatch(ctx context.Context, query string, opts ...driver.PrepareBatchOption) (driver.Batch, error) {
+	return &fakeBatch{}, nil
+}
+
+func (f *fakeConn) Stats() driver.Stats {
+	return driver.Stats{MaxOpenConns: 10, MaxIdleConns: 5, Open: 1, Idle: 1}
+}
+
+type fakeRows struct{}
+
+func (r *fakeRows) Next() bool                       { return false }
+func (r *fakeRows) Scan(dest ...any) error           { return nil }
+func (r *fakeRows) ScanStruct(dest any) error        { return nil }
+func (r *fakeRows) Columns() []string                { return nil }
+func (r *fakeRows) ColumnTypes() []driver.ColumnType { return nil }
+func (r *fakeRows) HasData() bool                    { return false }
+func (r *fakeRows) Totals(dest ...any) error         { return nil }
+func (r *fakeRows) Close() error                     { return nil }
+func (r *fakeRows) Err() error                       { return nil }
+
+type fakeRow struct{}
+
+func (r *fakeRow) Scan(dest ...any) error    { return nil }
+func (r *fakeRow) ScanStruct(dest any) error { return nil }
+func (r *fakeRow) Err() error                { return nil }
+
+type fakeBatch struct{}
+
+func (b *fakeBatch) Abort() error                  { return nil }
+func (b *fakeBatch) Append(v ...any) error         { return nil }
+func (b *fakeBatch) AppendStruct(v any) error      { return nil }
+func (b *fakeBatch) Column(int) driver.BatchColumn { return nil }
+func (b *fakeBatch) Flush() error                  { return nil }
+func (b *fakeBatch) Send() error                   { return nil }
+func (b *fakeBatch) IsSent() bool                  { return false }
+func (b *fakeBatch) Rows() int                     { return 0 }
+func (b *fakeBatch) Columns() []column.Interface   { return nil }
+func (b *fakeBatch) Close() error                  { return nil }
+
+func testConfig() *Config {
+	return &Config{
 		Host:            "localhost:9000",
 		Database:        "test",
 		Username:        "default",
@@ -51,65 +148,298 @@ func TestNewClient_Success(t *testing.T) {
 		ConnMaxLifeTime: 60,
 		ConnStrategy:    "round_robin",
 	}
+}
 
-	mockLogger := new(MockLogger)
-	mockLogger.On("Info", mock.Anything).Return()
-	mockLogger.On("Error", mock.Anything).Return()
-	mockLogger.On("Debug", mock.Anything).Return()
-	mockLogger.On("DebugF", mock.Anything, mock.Anything).Return()
-	mockLogger.On("Warn", mock.Anything).Return()
+func withFakeConn(t *testing.T, f *fakeConn) {
+	t.Helper()
+	orig := openConnFunc
+	openConnFunc = func(opts *clickhouse.Options) (conn, error) {
+		f.opts = opts
+		return f, nil
+	}
+	t.Cleanup(func() { openConnFunc = orig })
+}
 
-	client, err := New(config, mockLogger)
-	if err != nil {
-		t.Skipf("ClickHouse server not available: %v", err)
+func TestNewClient_Success(t *testing.T) {
+	f := &fakeConn{}
+	withFakeConn(t, f)
+
+	client, err := New(testConfig(), newMockLogger())
+	require.NoError(t, err)
+	require.NotNil(t, client)
+	assert.Equal(t, 1, f.pings)
+	assert.NotNil(t, f.opts)
+
+	require.NoError(t, client.Close())
+	assert.True(t, f.closed)
+}
+
+func TestNewClient_NilConfig(t *testing.T) {
+	client, err := New(nil, newMockLogger())
+	require.Error(t, err)
+	assert.Nil(t, client)
+	assert.Contains(t, err.Error(), "config cannot be nil")
+}
+
+func TestNewClient_OpenError(t *testing.T) {
+	orig := openConnFunc
+	defer func() { openConnFunc = orig }()
+	openConnFunc = func(opts *clickhouse.Options) (conn, error) {
+		return nil, errors.New("dial failed")
 	}
 
-	assert.NoError(t, err)
-	assert.NotNil(t, client)
+	client, err := New(testConfig(), newMockLogger())
+	require.Error(t, err)
+	assert.Nil(t, client)
+	assert.Contains(t, err.Error(), "dial failed")
+}
 
-	if client != nil {
-		client.Close()
+func TestNewClient_PingError(t *testing.T) {
+	f := &fakeConn{pingErr: errors.New("ping failed")}
+	withFakeConn(t, f)
+
+	client, err := New(testConfig(), newMockLogger())
+	require.Error(t, err)
+	assert.Nil(t, client)
+	assert.Contains(t, err.Error(), "ping failed")
+	assert.True(t, f.closed, "connection must be closed after failed ping")
+}
+
+func TestNewClient_NilLogger(t *testing.T) {
+	f := &fakeConn{}
+	withFakeConn(t, f)
+
+	client, err := New(testConfig(), nil)
+	require.NoError(t, err)
+	require.NotNil(t, client)
+	require.NoError(t, client.Close())
+}
+
+func TestCloseError(t *testing.T) {
+	f := &fakeConn{closeErr: errors.New("close failed")}
+	withFakeConn(t, f)
+
+	client, err := New(testConfig(), newMockLogger())
+	require.NoError(t, err)
+
+	err = client.Close()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "close failed")
+}
+
+func TestPing(t *testing.T) {
+	f := &fakeConn{}
+	withFakeConn(t, f)
+
+	client, err := New(testConfig(), newMockLogger())
+	require.NoError(t, err)
+	defer client.Close()
+
+	require.NoError(t, client.Ping(context.Background()))
+	f.pingErr = errors.New("down")
+	require.Error(t, client.Ping(context.Background()))
+}
+
+func TestQueryWithoutTracer(t *testing.T) {
+	f := &fakeConn{queryErr: errors.New("query failed")}
+	withFakeConn(t, f)
+
+	client, err := New(testConfig(), newMockLogger())
+	require.NoError(t, err)
+	defer client.Close()
+
+	rows, err := client.Query(context.Background(), "SELECT 1")
+	require.Error(t, err)
+	assert.Nil(t, rows)
+}
+
+func TestQueryRowWithoutTracer(t *testing.T) {
+	f := &fakeConn{}
+	withFakeConn(t, f)
+
+	client, err := New(testConfig(), newMockLogger())
+	require.NoError(t, err)
+	defer client.Close()
+
+	row := client.QueryRow(context.Background(), "SELECT 1")
+	require.NoError(t, row.Scan())
+}
+
+func TestExecWithoutTracer(t *testing.T) {
+	f := &fakeConn{}
+	withFakeConn(t, f)
+
+	client, err := New(testConfig(), newMockLogger())
+	require.NoError(t, err)
+	defer client.Close()
+
+	require.NoError(t, client.Exec(context.Background(), "INSERT INTO t VALUES (1)"))
+
+	f.execErr = errors.New("insert failed")
+	require.Error(t, client.Exec(context.Background(), "INSERT INTO t VALUES (2)"))
+}
+
+func TestSelectWithoutTracer(t *testing.T) {
+	f := &fakeConn{}
+	withFakeConn(t, f)
+
+	client, err := New(testConfig(), newMockLogger())
+	require.NoError(t, err)
+	defer client.Close()
+
+	var dest []int
+	require.NoError(t, client.Select(context.Background(), &dest, "SELECT 1"))
+}
+
+func TestAsyncInsertWithoutTracer(t *testing.T) {
+	f := &fakeConn{}
+	withFakeConn(t, f)
+
+	client, err := New(testConfig(), newMockLogger())
+	require.NoError(t, err)
+	defer client.Close()
+
+	require.NoError(t, client.AsyncInsert(context.Background(), "INSERT INTO t VALUES (1)", true))
+}
+
+func TestPrepareBatchWithoutTracer(t *testing.T) {
+	f := &fakeConn{}
+	withFakeConn(t, f)
+
+	client, err := New(testConfig(), newMockLogger())
+	require.NoError(t, err)
+	defer client.Close()
+
+	batch, err := client.PrepareBatch(context.Background(), "INSERT INTO t VALUES (1)")
+	require.NoError(t, err)
+	require.NoError(t, batch.Send())
+}
+
+func TestStats(t *testing.T) {
+	f := &fakeConn{}
+	withFakeConn(t, f)
+
+	client, err := New(testConfig(), newMockLogger())
+	require.NoError(t, err)
+	defer client.Close()
+
+	stats := client.Stats()
+	assert.Equal(t, 10, stats.MaxOpenConns)
+	assert.Equal(t, 1, stats.Idle)
+}
+
+func TestWithTracerOption(t *testing.T) {
+	tr := &NoOpTracer{}
+	f := &fakeConn{}
+	withFakeConn(t, f)
+
+	client, err := New(testConfig(), newMockLogger(), WithTracer(tr))
+	require.NoError(t, err)
+	defer client.Close()
+	assert.NotNil(t, client.tracer)
+}
+
+func TestQueriesWithTracer(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	tr := NewOpenTelemetryTracer(tp.Tracer("test"))
+	f := &fakeConn{}
+	withFakeConn(t, f)
+
+	client, err := New(testConfig(), newMockLogger(), WithTracer(tr))
+	require.NoError(t, err)
+	defer client.Close()
+
+	rows, err := client.Query(context.Background(), "SELECT 1")
+	require.NoError(t, err)
+	rows.Close()
+
+	client.QueryRow(context.Background(), "SELECT 1").Scan()
+
+	require.NoError(t, client.Exec(context.Background(), "INSERT INTO t VALUES (1)"))
+	var dest []int
+	require.NoError(t, client.Select(context.Background(), &dest, "SELECT 1"))
+	require.NoError(t, client.AsyncInsert(context.Background(), "INSERT INTO t VALUES (1)", true))
+
+	assert.GreaterOrEqual(t, len(recorder.Ended()), 5)
+	for _, span := range recorder.Ended() {
+		assert.Equal(t, trace.SpanKindClient, span.SpanKind())
 	}
 }
 
-func TestNewClient_ValidationErrors(t *testing.T) {
-	tests := []struct {
-		name   string
-		config *Config
+func TestQueriesWithTracerError(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	tr := NewOpenTelemetryTracer(tp.Tracer("test"))
+	f := &fakeConn{execErr: errors.New("boom")}
+	withFakeConn(t, f)
+
+	client, err := New(testConfig(), newMockLogger(), WithTracer(tr))
+	require.NoError(t, err)
+	defer client.Close()
+
+	require.Error(t, client.Exec(context.Background(), "INSERT INTO t VALUES (1)"))
+
+	spans := recorder.Ended()
+	require.NotEmpty(t, spans)
+	status := spans[0].Status()
+	assert.Equal(t, codes.Error, status.Code)
+}
+
+func TestBuildClickHouseOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		strategy string
+		expected clickhouse.ConnOpenStrategy
 	}{
-		{
-			name:   "nil config",
-			config: nil,
-		},
-		{
-			name: "invalid host",
-			config: &Config{
-				Host:            "invalid_host:9999",
-				Database:        "test",
-				Username:        "user",
-				Password:        "pass",
-				DialTimeout:     1,
-				MaxOpenConns:    1,
-				MaxIdleConns:    1,
-				ConnMaxLifeTime: 1,
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mockLogger := new(MockLogger)
-			mockLogger.On("Error", mock.Anything).Return()
-			mockLogger.On("Info", mock.Anything).Return()
-			mockLogger.On("Debug", mock.Anything).Return()
-			mockLogger.On("DebugF", mock.Anything, mock.Anything).Return()
-			mockLogger.On("Warn", mock.Anything).Return()
-
-			client, err := New(tt.config, mockLogger)
-			assert.Error(t, err)
-			assert.Nil(t, client)
+		{name: "round robin", strategy: "round_robin", expected: clickhouse.ConnOpenRoundRobin},
+		{name: "random", strategy: "random", expected: clickhouse.ConnOpenRandom},
+		{name: "in order", strategy: "in_order", expected: clickhouse.ConnOpenInOrder},
+		{name: "default", strategy: "unknown", expected: clickhouse.ConnOpenRoundRobin},
+		{name: "empty", strategy: "", expected: clickhouse.ConnOpenRoundRobin},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.ConnStrategy = tc.strategy
+			opts := buildClickHouseOptions(cfg)
+			assert.Equal(t, tc.expected, opts.ConnOpenStrategy)
+			assert.Equal(t, []string{"localhost:9000"}, opts.Addr)
+			assert.NotNil(t, opts.TLS)
+			assert.NotNil(t, opts.DialContext)
 		})
 	}
+}
+
+func TestDialContextHook(t *testing.T) {
+	opts := buildClickHouseOptions(testConfig())
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer l.Close()
+
+	conn, err := opts.DialContext(context.Background(), l.Addr().String())
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+}
+
+func TestDefaultOpenConnFunc(t *testing.T) {
+	c, err := openConnFunc(&clickhouse.Options{Addr: []string{"127.0.0.1:1"}})
+	require.NoError(t, err)
+	require.NotNil(t, c)
+	require.NoError(t, c.Close())
+}
+
+func TestNoopLoggerUsed(t *testing.T) {
+	f := &fakeConn{}
+	withFakeConn(t, f)
+	client, err := New(testConfig(), NoopLogger{})
+	require.NoError(t, err)
+	require.NoError(t, client.Close())
+
+	f2 := &fakeConn{pingErr: errors.New("down")}
+	withFakeConn(t, f2)
+	_, err = New(testConfig(), NoopLogger{})
+	require.Error(t, err)
 }
 
 func TestHelperFunctions(t *testing.T) {
@@ -123,6 +453,10 @@ func TestHelperFunctions(t *testing.T) {
 		{"update", "UPDATE users SET name='test'", "update"},
 		{"delete", "DELETE FROM users", "delete"},
 		{"create", "CREATE TABLE test", "create"},
+		{"drop", "DROP TABLE test", "drop"},
+		{"alter", "ALTER TABLE users ADD COLUMN age UInt8", "alter"},
+		{"truncate", "TRUNCATE TABLE users", "truncate"},
+		{"optimize", "OPTIMIZE TABLE users FINAL", "optimize"},
 		{"unknown", "EXPLAIN SELECT 1", "unknown"},
 	}
 
@@ -139,6 +473,12 @@ func TestTruncateQuery(t *testing.T) {
 	truncated := truncateQuery(longQuery, 50)
 	assert.LessOrEqual(t, len(truncated), 53)
 	assert.Contains(t, truncated, "...")
+
+	short := truncateQuery("SELECT 1", 500)
+	assert.Equal(t, "SELECT 1", short)
+
+	multiline := truncateQuery("SELECT\n\t1", 500)
+	assert.Equal(t, "SELECT 1", multiline)
 }
 
 func TestClassifyError(t *testing.T) {
@@ -170,6 +510,11 @@ func TestClassifyError(t *testing.T) {
 		{
 			name:     "deadline string",
 			err:      fmt.Errorf("deadline exceeded"),
+			expected: "timeout",
+		},
+		{
+			name:     "deadline word",
+			err:      fmt.Errorf("deadline"),
 			expected: "timeout",
 		},
 		{
@@ -249,12 +594,30 @@ func TestBuildAttributes(t *testing.T) {
 	assert.Greater(t, len(attrs), 5)
 }
 
-func TestExtractRequestID(t *testing.T) {
-	ctx := context.Background()
-	assert.Empty(t, ExtractRequestID(ctx))
+func TestOpenTelemetryTracer(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	tr := NewOpenTelemetryTracer(tp.Tracer("test"))
 
-	ctx = context.WithValue(ctx, "X-Request-Id", "test-123")
-	assert.Equal(t, "test-123", ExtractRequestID(ctx))
+	ctx, span := tr.StartSpan(context.Background(), "op", nil)
+	assert.NotNil(t, span)
+	tr.EndSpan(span, nil, time.Now())
+
+	_, span = tr.StartSpan(ctx, "op2", nil)
+	tr.EndSpan(span, errors.New("failed"), time.Now())
+
+	tr.EndSpan("not-a-span", nil, time.Now())
+
+	spans := recorder.Ended()
+	assert.Len(t, spans, 2)
+}
+
+func TestNoOpTracer(t *testing.T) {
+	tr := &NoOpTracer{}
+	ctx, span := tr.StartSpan(context.Background(), "op", nil)
+	assert.Nil(t, span)
+	assert.Equal(t, context.Background(), ctx)
+	tr.EndSpan(span, nil, time.Now())
 }
 
 func BenchmarkDetectQueryType(b *testing.B) {
@@ -277,183 +640,4 @@ func BenchmarkDetectQueryType(b *testing.B) {
 			detectQueryType(query)
 		}
 	}
-}
-
-func BenchmarkTruncateQuery(b *testing.B) {
-	query := "SELECT users.id, users.name, users.email, orders.total, orders.created_at FROM users INNER JOIN orders ON users.id = orders.user_id WHERE users.status = 'active' AND orders.status = 'completed' ORDER BY orders.created_at DESC LIMIT 100"
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		truncateQuery(query, 200)
-	}
-}
-
-func BenchmarkTruncateQuery_Short(b *testing.B) {
-	query := "SELECT 1"
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		truncateQuery(query, 200)
-	}
-}
-
-func BenchmarkTruncateQuery_Multiline(b *testing.B) {
-	query := `
-		SELECT 
-			u.id,
-			u.name,
-			u.email,
-			COUNT(o.id) as order_count,
-			SUM(o.total) as total_spent
-		FROM users u
-		LEFT JOIN orders o ON u.id = o.user_id
-		WHERE u.created_at >= '2023-01-01'
-		GROUP BY u.id, u.name, u.email
-		HAVING COUNT(o.id) > 5
-		ORDER BY total_spent DESC
-		LIMIT 100
-	`
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		truncateQuery(query, 100)
-	}
-}
-
-func BenchmarkClassifyError(b *testing.B) {
-	errors := []error{
-		nil,
-		context.DeadlineExceeded,
-		context.Canceled,
-		fmt.Errorf("connection timeout"),
-		fmt.Errorf("connection refused"),
-		fmt.Errorf("connection reset by peer"),
-		fmt.Errorf("database connection error"),
-		fmt.Errorf("SQL syntax error near SELECT"),
-		fmt.Errorf("authentication failed"),
-		fmt.Errorf("permission denied for table users"),
-		fmt.Errorf("table not found"),
-		fmt.Errorf("duplicate key value"),
-		errors.New("some random error"),
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		for _, err := range errors {
-			classifyError(err)
-		}
-	}
-}
-
-func BenchmarkBuildQueryAttributes(b *testing.B) {
-	config := &Config{
-		Host:         "clickhouse-node1:9000,clickhouse-node2:9000",
-		Database:     "analytics",
-		Username:     "reader",
-		ConnStrategy: "round_robin",
-	}
-	query := "SELECT user_id, event_type, timestamp FROM events WHERE date >= today() - 7"
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		buildQueryAttributes(config, query, "query", 0)
-	}
-}
-
-func BenchmarkBuildExecAttributes(b *testing.B) {
-	config := &Config{
-		Host:         "clickhouse-node1:9000,clickhouse-node2:9000",
-		Database:     "analytics",
-		Username:     "writer",
-		ConnStrategy: "in_order",
-	}
-	query := "INSERT INTO events (user_id, event_type, timestamp) VALUES (?, ?, ?)"
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		buildExecAttributes(config, query, 3)
-	}
-}
-
-func BenchmarkExtractRequestID(b *testing.B) {
-	ctxWithID := context.WithValue(context.Background(), "X-Request-Id", "req-12345-abcde")
-	ctxWithoutID := context.Background()
-
-	b.Run("with request id", func(b *testing.B) {
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			ExtractRequestID(ctxWithID)
-		}
-	})
-
-	b.Run("without request id", func(b *testing.B) {
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			ExtractRequestID(ctxWithoutID)
-		}
-	})
-}
-
-func BenchmarkConfigValidation(b *testing.B) {
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = &Config{
-			Host:            "localhost:9000",
-			Database:        "test",
-			Username:        "default",
-			Password:        "password",
-			DialTimeout:     10,
-			MaxOpenConns:    25,
-			MaxIdleConns:    10,
-			ConnMaxLifeTime: 60,
-			ConnStrategy:    "round_robin",
-		}
-	}
-}
-
-func BenchmarkNoOpTracer(b *testing.B) {
-	tracer := &NoOpTracer{}
-	ctx := context.Background()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, span := tracer.StartSpan(ctx, "test", nil)
-		tracer.EndSpan(span, nil, time.Now())
-	}
-}
-
-func BenchmarkDetectQueryType_Parallel(b *testing.B) {
-	queries := []string{
-		"SELECT * FROM users",
-		"INSERT INTO users VALUES (1)",
-		"UPDATE users SET name = 'test'",
-		"DELETE FROM users",
-		"CREATE TABLE test",
-	}
-
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			detectQueryType(queries[i%len(queries)])
-			i++
-		}
-	})
-}
-
-func BenchmarkClassifyError_Parallel(b *testing.B) {
-	errors := []error{
-		nil,
-		context.DeadlineExceeded,
-		fmt.Errorf("connection timeout"),
-		fmt.Errorf("syntax error"),
-		fmt.Errorf("unknown error"),
-	}
-
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			classifyError(errors[i%len(errors)])
-			i++
-		}
-	})
 }

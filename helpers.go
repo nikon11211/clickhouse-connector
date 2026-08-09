@@ -8,10 +8,12 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 )
 
+const maxQueryAttrLength = 500
+
 func buildQueryAttributes(config *Config, query, operation string, argsCount int) []attribute.KeyValue {
 	return []attribute.KeyValue{
 		attribute.String("db.system", "clickhouse"),
-		attribute.String("db.statement", truncateQuery(query, 500)),
+		attribute.String("db.statement", truncateQuery(query, maxQueryAttrLength)),
 		attribute.String("db.operation", operation),
 		attribute.String("db.name", config.Database),
 		attribute.String("db.user", config.Username),
@@ -26,7 +28,7 @@ func buildQueryAttributes(config *Config, query, operation string, argsCount int
 func buildExecAttributes(config *Config, query string, argsCount int) []attribute.KeyValue {
 	return []attribute.KeyValue{
 		attribute.String("db.system", "clickhouse"),
-		attribute.String("db.statement", truncateQuery(query, 500)),
+		attribute.String("db.statement", truncateQuery(query, maxQueryAttrLength)),
 		attribute.String("db.operation", "exec"),
 		attribute.String("db.name", config.Database),
 		attribute.String("db.user", config.Username),
@@ -112,13 +114,4 @@ func detectQueryType(query string) string {
 	default:
 		return "unknown"
 	}
-}
-
-func ExtractRequestID(ctx context.Context) string {
-	if reqID := ctx.Value("X-Request-Id"); reqID != nil {
-		if s, ok := reqID.(string); ok {
-			return s
-		}
-	}
-	return ""
 }
