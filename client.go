@@ -12,9 +12,25 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 )
 
+type conn interface {
+	Ping(ctx context.Context) error
+	Close() error
+	Query(ctx context.Context, query string, args ...any) (driver.Rows, error)
+	QueryRow(ctx context.Context, query string, args ...any) driver.Row
+	Exec(ctx context.Context, query string, args ...any) error
+	Select(ctx context.Context, dest any, query string, args ...any) error
+	AsyncInsert(ctx context.Context, query string, wait bool, args ...any) error
+	PrepareBatch(ctx context.Context, query string, opts ...driver.PrepareBatchOption) (driver.Batch, error)
+	Stats() driver.Stats
+}
+
+var openConnFunc = func(opts *clickhouse.Options) (conn, error) {
+	return clickhouse.Open(opts)
+}
+
 type Client struct {
 	Logger
-	conn   clickhouse.Conn
+	conn   conn
 	tracer Tracer
 	config *Config
 }
@@ -47,10 +63,13 @@ func New(config *Config, logger Logger, opts ...Option) (*Client, error) {
 	if config == nil {
 		return nil, fmt.Errorf("%s: config cannot be nil", op)
 	}
+	if logger == nil {
+		logger = NoopLogger{}
+	}
 
 	clickhouseOpts := buildClickHouseOptions(config)
 
-	conn, err := clickhouse.Open(clickhouseOpts)
+	conn, err := openConnFunc(clickhouseOpts)
 	if err != nil {
 		logger.Error(fmt.Sprintf("(%s) failed to connect to database: %s", op, err.Error()))
 		return nil, fmt.Errorf("%s: %w", op, err)
@@ -61,7 +80,7 @@ func New(config *Config, logger Logger, opts ...Option) (*Client, error) {
 
 	if err := conn.Ping(pingCtx); err != nil {
 		logger.Error(fmt.Sprintf("(%s) database ping failed: %s", op, err.Error()))
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 
@@ -86,10 +105,10 @@ func WithTracer(tracer Tracer) Option {
 func (c *Client) Close() error {
 	const op = "clickhouse.Close"
 	if err := c.conn.Close(); err != nil {
-		c.Logger.Error(fmt.Sprintf("(%s) failed to close connection: %s", op, err.Error()))
+		c.Error(fmt.Sprintf("(%s) failed to close connection: %s", op, err.Error()))
 		return fmt.Errorf("%s: %w", op, err)
 	}
-	c.Logger.Info(fmt.Sprintf("(%s) connection closed successfully", op))
+	c.Info(fmt.Sprintf("(%s) connection closed successfully", op))
 	return nil
 }
 
@@ -97,7 +116,7 @@ func (c *Client) Ping(ctx context.Context) error {
 	return c.conn.Ping(ctx)
 }
 
-func (c *Client) Query(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+func (c *Client) Query(ctx context.Context, query string, args ...any) (rows driver.Rows, err error) {
 	if c.tracer == nil {
 		return c.conn.Query(ctx, query, args...)
 	}
@@ -107,10 +126,10 @@ func (c *Client) Query(ctx context.Context, query string, args ...any) (driver.R
 		buildQueryAttributes(c.config, query, "query", len(args)),
 	)
 	defer func() {
-		c.tracer.EndSpan(span, nil, startTime)
+		c.tracer.EndSpan(span, err, startTime)
 	}()
 
-	rows, err := c.conn.Query(ctx, query, args...)
+	rows, err = c.conn.Query(ctx, query, args...)
 	return rows, err
 }
 
@@ -127,7 +146,7 @@ func (c *Client) QueryRow(ctx context.Context, query string, args ...any) driver
 	return c.conn.QueryRow(ctx, query, args...)
 }
 
-func (c *Client) Exec(ctx context.Context, query string, args ...any) error {
+func (c *Client) Exec(ctx context.Context, query string, args ...any) (err error) {
 	if c.tracer == nil {
 		return c.conn.Exec(ctx, query, args...)
 	}
@@ -137,14 +156,14 @@ func (c *Client) Exec(ctx context.Context, query string, args ...any) error {
 		buildExecAttributes(c.config, query, len(args)),
 	)
 	defer func() {
-		c.tracer.EndSpan(span, nil, startTime)
+		c.tracer.EndSpan(span, err, startTime)
 	}()
 
-	err := c.conn.Exec(ctx, query, args...)
+	err = c.conn.Exec(ctx, query, args...)
 	return err
 }
 
-func (c *Client) Select(ctx context.Context, dest any, query string, args ...any) error {
+func (c *Client) Select(ctx context.Context, dest any, query string, args ...any) (err error) {
 	if c.tracer == nil {
 		return c.conn.Select(ctx, dest, query, args...)
 	}
@@ -154,14 +173,14 @@ func (c *Client) Select(ctx context.Context, dest any, query string, args ...any
 		buildExecAttributes(c.config, query, len(args)),
 	)
 	defer func() {
-		c.tracer.EndSpan(span, nil, startTime)
+		c.tracer.EndSpan(span, err, startTime)
 	}()
 
-	err := c.conn.Select(ctx, dest, query, args...)
+	err = c.conn.Select(ctx, dest, query, args...)
 	return err
 }
 
-func (c *Client) AsyncInsert(ctx context.Context, query string, wait bool, args ...any) error {
+func (c *Client) AsyncInsert(ctx context.Context, query string, wait bool, args ...any) (err error) {
 	if c.tracer == nil {
 		return c.conn.AsyncInsert(ctx, query, wait, args...)
 	}
@@ -171,10 +190,10 @@ func (c *Client) AsyncInsert(ctx context.Context, query string, wait bool, args 
 		buildExecAttributes(c.config, query, len(args)),
 	)
 	defer func() {
-		c.tracer.EndSpan(span, nil, startTime)
+		c.tracer.EndSpan(span, err, startTime)
 	}()
 
-	err := c.conn.AsyncInsert(ctx, query, wait, args...)
+	err = c.conn.AsyncInsert(ctx, query, wait, args...)
 	return err
 }
 

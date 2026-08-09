@@ -47,7 +47,7 @@ type User struct {
 
 func main() {
 	tp := initTracer()
-	defer tp.Shutdown(context.Background())
+	defer func() { _ = tp.Shutdown(context.Background()) }()
 
 	config := &clickhouse.Config{
 		Host:            getEnv("CLICKHOUSE_HOST", "localhost:9000"),
@@ -68,7 +68,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create ClickHouse client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx := context.Background()
 

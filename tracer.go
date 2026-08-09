@@ -10,8 +10,8 @@ import (
 )
 
 type Tracer interface {
-	StartSpan(ctx context.Context, name string, attrs []attribute.KeyValue) (context.Context, interface{})
-	EndSpan(span interface{}, err error, startTime time.Time)
+	StartSpan(ctx context.Context, name string, attrs []attribute.KeyValue) (context.Context, any)
+	EndSpan(span any, err error, startTime time.Time)
 }
 
 type OpenTelemetryTracer struct {
@@ -22,7 +22,7 @@ func NewOpenTelemetryTracer(tracer trace.Tracer) *OpenTelemetryTracer {
 	return &OpenTelemetryTracer{tracer: tracer}
 }
 
-func (t *OpenTelemetryTracer) StartSpan(ctx context.Context, name string, attrs []attribute.KeyValue) (context.Context, interface{}) {
+func (t *OpenTelemetryTracer) StartSpan(ctx context.Context, name string, attrs []attribute.KeyValue) (context.Context, any) {
 	ctx, span := t.tracer.Start(ctx, name,
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attrs...),
@@ -30,7 +30,7 @@ func (t *OpenTelemetryTracer) StartSpan(ctx context.Context, name string, attrs 
 	return ctx, span
 }
 
-func (t *OpenTelemetryTracer) EndSpan(span interface{}, err error, startTime time.Time) {
+func (t *OpenTelemetryTracer) EndSpan(span any, err error, startTime time.Time) {
 	otelSpan, ok := span.(trace.Span)
 	if !ok {
 		return
@@ -60,8 +60,8 @@ func (t *OpenTelemetryTracer) EndSpan(span interface{}, err error, startTime tim
 
 type NoOpTracer struct{}
 
-func (t *NoOpTracer) StartSpan(ctx context.Context, name string, attrs []attribute.KeyValue) (context.Context, interface{}) {
+func (t *NoOpTracer) StartSpan(ctx context.Context, name string, attrs []attribute.KeyValue) (context.Context, any) {
 	return ctx, nil
 }
 
-func (t *NoOpTracer) EndSpan(span interface{}, err error, startTime time.Time) {}
+func (t *NoOpTracer) EndSpan(span any, err error, startTime time.Time) {}
